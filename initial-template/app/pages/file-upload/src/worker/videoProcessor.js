@@ -1,13 +1,19 @@
 export default class ViewProcessor {
   #mp4Demuxer;
+  #webMWriter;
+  #service;
 
   /**
    *
    * @param {object} options
    * @param {import('./mp4Demuxer.js').default} options.mp4Demuxer
+   * @param {import('../deps/webm-writer2.js').default} options.webMWriter
+   * @param {import('./service.js').default} options.service
    */
-  constructor({ mp4Demuxer }) {
+  constructor({ mp4Demuxer, webMWriter, service }) {
     this.#mp4Demuxer = mp4Demuxer;
+    this.#webMWriter = webMWriter;
+    this.#service = service;
   }
 
   /**
@@ -30,14 +36,14 @@ export default class ViewProcessor {
 
         this.#mp4Demuxer.run(stream, {
           async onConfig(config) {
-            const { supported } = await VideoDecoder.isConfigSupported(config);
-            if (!supported) {
-              console.error(
-                "mp4Muxer VideoDecoder config not supported",
-                config
-              );
-              return;
-            }
+            // const { supported } = await VideoDecoder.isConfigSupported(config);
+            // if (!supported) {
+            //   console.error(
+            //     "mp4Muxer VideoDecoder config not supported",
+            //     config
+            //   );
+            //   return;
+            // }
             decoder.configure(config);
           },
           /** @param {EncodedVideoChunk} chunk */
@@ -132,18 +138,66 @@ export default class ViewProcessor {
     });
   }
 
+  transformIntoWebM() {
+    const writable = new WritableStream({
+      write: (chunk) => {
+        this.#webMWriter.addFrame(chunk);
+      },
+      close() {},
+    });
+    return {
+      readable: this.#webMWriter.getStream(),
+      writable,
+    };
+  }
+
+  upload(filename, resolution, type) {
+    const chunks = [];
+    let byteCount = 0;
+    let segmentCount = 0;
+
+    const triggerUpload = async (chunks) => {
+      const blob = new Blob(chunks, { type: "video/webm" });
+
+      await this.#service.uploadFile({
+        filename: `${filename}-${resolution}.${++segmentCount}.${type}`,
+        fileBuffer: blob,
+      });
+
+      // reseta o array
+      chunks.length = 0;
+      byteCount = 0;
+    };
+
+    return new WritableStream({
+      /**
+       * @param {object} options
+       * @param {Uint8Array} options.data
+       */
+      async write({ data }) {
+        chunks.push(data);
+        byteCount += data.byteLength;
+
+        if (byteCount <= 10e6) return;
+
+        await triggerUpload(chunks);
+        // renderFrame(frame);
+      },
+      async close() {
+        if (!chunks.length) return;
+
+        await triggerUpload(chunks);
+      },
+    });
+  }
+
   async start({ file, encoderConfig, renderFrame }) {
     const stream = file.stream();
     const filename = file.name.split("/").pop().replace(".mp4", "");
     await this.mp4Decoder(stream)
       .pipeThrough(this.encode144p(encoderConfig))
       .pipeThrough(this.renderDecodedFramesAndGetEncodedChunks(renderFrame))
-      .pipeTo(
-        new WritableStream({
-          write(frame) {
-            // renderFrame(frame);
-          },
-        })
-      );
+      .pipeThrough(this.transformIntoWebM())
+      .pipeTo(this.upload(filename, "144p", "webm"));
   }
 }
